@@ -1,0 +1,6 @@
+flask
+flask-session
+python-dotenv
+requests
+PyPDF2
+numpy
