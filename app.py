@@ -2,22 +2,30 @@ print("🚀 App starting...")
 
 # app.py
 import os
-import json
 import time
-from flask import Flask, request, render_template, session
-from flask_session import Session
+import re
+from datetime import datetime
+from flask import Flask, request, render_template
 from dotenv import load_dotenv
-from utils import load_text, load_pdf, chunk_text, get_relevant_chunks, ask_nvidia
+
+# Local imports
+from utils import load_text, load_pdf, chunk_text, ask_nvidia
+from rag_utils import create_embeddings, build_faiss_index, search_faiss
+from database import init_db, save_message, load_messages
 
 load_dotenv()
 
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = "./data"
-app.config['SECRET_KEY'] = "supersecretkey"
-app.config['SESSION_TYPE'] = "filesystem"
-Session(app)
 
-# Clean old files
+# -------- GLOBAL (FAISS cannot be stored in session) --------
+faiss_index = None
+chunks_store = []
+
+# -------- INIT DATABASE --------
+init_db()
+
+# -------- CLEAN OLD FILES --------
 def cleanup_uploads(folder, max_age_seconds=3600):
     now = time.time()
     for f in os.listdir(folder):
@@ -25,81 +33,94 @@ def cleanup_uploads(folder, max_age_seconds=3600):
         if os.path.isfile(path) and now - os.path.getmtime(path) > max_age_seconds:
             os.remove(path)
 
-# Handle question with keyword-based chunk selection
+# -------- EXTRACT SOURCES --------
+def extract_sources(text):
+    return list(set(re.findall(r'Page\s*\d+', text)))
+
+# -------- AI FUNCTION --------
 def ask_question(question):
-    try:
-        chat_history = session.get("chat_history", [])
-        chunks = session.get("chunks", [])
+    global faiss_index, chunks_store
 
-        if not chunks:
-            return "❌ Please upload a document first."
+    if not chunks_store or faiss_index is None:
+        return "❌ Please upload a document first.", []
 
-        context_chunks = get_relevant_chunks(question, chunks)
-        context = " ".join(context_chunks)
+    context_chunks = search_faiss(question, chunks_store, faiss_index)
 
-        prompt = f"""
-        Return answer in JSON format:
-        {{
-          "answer": "...",
-          "confidence": "high/medium/low"
-        }}
-        Context:
-        {context}
-        Question:
-        {question}
-        """
+    # Build context text with page numbers
+    context_text = ""
+    for c in context_chunks:
+        context_text += f"{c['chunk']} (Page {c['page']})\n"
 
-        reply = ask_nvidia(prompt, chat_history)
+    prompt = f"""
+    Answer clearly and concisely.
+    Quote the exact text from context if available, with page numbers.
+    If not found, say: Not available.
 
-        # Save chat history
-        chat_history.append({"role": "user", "content": prompt})
-        chat_history.append({"role": "assistant", "content": reply})
-        session["chat_history"] = chat_history
+    Context:
+    {context_text}
 
-        try:
-            parsed = json.loads(reply)
-            return f"{parsed['answer']} (Confidence: {parsed['confidence']})"
-        except:
-            return reply
+    Question:
+    {question}
+    """
 
-    except Exception as e:
-        return f"❌ Error: {str(e)}"
+    reply = ask_nvidia(prompt, [])
 
+    # Extract sources
+    sources = list(set([f"Page {c['page']}" for c in context_chunks]))
+
+    return reply, sources
+
+# -------- ROUTE --------
 @app.route("/", methods=["GET", "POST"])
 def index():
-    answer = ""
-    uploaded_files = []
+    global faiss_index, chunks_store
+
     cleanup_uploads(app.config['UPLOAD_FOLDER'])
 
     if request.method == "POST":
         files = request.files.getlist("file")
-        question = request.form.get("question", "")
-        all_chunks = []
+        question = request.form.get("question", "").strip()
 
+        # -------- FILE UPLOAD --------
         if files and any(f.filename for f in files):
-            for file in files:
-                filename = os.path.join(app.config['UPLOAD_FOLDER'], file.filename)
-                file.save(filename)
-                uploaded_files.append(file.filename)
+            all_chunks = []
 
-                # Load content
-                if filename.endswith(".pdf"):
-                    text = load_pdf(filename)
+            for file in files:
+                path = os.path.join(app.config['UPLOAD_FOLDER'], file.filename)
+                file.save(path)
+
+                if path.endswith(".pdf"):
+                    text = load_pdf(path)
                 else:
-                    text = load_text(filename)
+                    text = load_text(path)
 
                 chunks = chunk_text(text)
                 all_chunks.extend(chunks)
 
-            # Save chunks & reset chat memory
-            session["chunks"] = all_chunks
-            session["chat_history"] = []
+            # 🔥 Create embeddings + FAISS
+            embeddings = create_embeddings(all_chunks)
+            faiss_index = build_faiss_index(embeddings)
 
+            chunks_store = all_chunks
+
+        # -------- ASK QUESTION --------
         if question:
-            answer = ask_question(question)
+            current_time = datetime.now().strftime("%H:%M")
 
-    return render_template("index.html", answer=answer, files=uploaded_files)
+            # Save user message
+            save_message("user", question, current_time)
 
+            answer, sources = ask_question(question)
+
+            # Save AI response
+            save_message("assistant", answer, current_time)
+
+    # Load chat history from DB
+    chat_history = load_messages()
+
+    return render_template("index.html", chat_history=chat_history)
+
+# -------- RUN --------
 if __name__ == "__main__":
     os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)

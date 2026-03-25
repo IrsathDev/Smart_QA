@@ -4,3 +4,7 @@ python-dotenv
 requests
 PyPDF2
 numpy
+faiss-cpu
+pandas
+scikit-learn
+sentence-transformers
