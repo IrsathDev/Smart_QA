@@ -1,0 +1,36 @@
+# requirements.txt
+# Step 1 Upgrade: FAISS removed → ChromaDB (lightweight, Railway-friendly)
+
+# ── Web framework ─────────────────────────────────────────────────────────────
+flask
+python-dotenv
+
+# ── PDF parsing ───────────────────────────────────────────────────────────────
+PyPDF2
+
+# ── Vector database (replaces FAISS — much lighter!) ─────────────────────────
+chromadb==0.5.3
+
+# ── BM25 keyword search (Step 2 addition — tiny package, no extra deps) ──────
+rank-bm25==0.2.2
+
+# ── LangGraph — agentic RAG orchestration (Step 3) ───────────────────────────
+langgraph==0.2.28
+
+ 
+# Pydantic — structured output validation (Step 4)
+pydantic==2.7.4
+ 
+# LangSmith — observability tracing (Step 4, optional but recommended)
+langsmith==0.1.98
+
+# ── HTTP requests (for NVIDIA API calls) ─────────────────────────────────────
+requests
+
+# ── Database ──────────────────────────────────────────────────────────────────
+# sqlite3 is built into Python, no install needed
+
+# ── REMOVED in Step 1 ────────────────────────────────────────────────────────
+# faiss-cpu          ← was 200MB+, killed Railway free tier
+# sentence-transformers ← was loading 400MB model locally
+# numpy              ← no longer needed (ChromaDB handles internally)

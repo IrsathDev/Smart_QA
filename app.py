@@ -1,31 +1,42 @@
+# app.py
+# Step 4 Upgrade: Streaming SSE + Pydantic Validation + LangSmith Tracing
+# Bug fix: PRG (Post-Redirect-Get) pattern — prevents duplicate submissions on reload
+
 print("🚀 App starting...")
 
-# app.py
 import os
-import time
 import re
+import time
+import json
 from datetime import datetime
-from flask import Flask, request, render_template
+from flask import Flask, request, render_template, Response, stream_with_context, redirect, url_for, session
 from dotenv import load_dotenv
 
-# Local imports
-from utils import load_text, load_pdf, chunk_text, ask_nvidia
-from rag_utils import create_embeddings, build_faiss_index, search_faiss
-from database import init_db, save_message, load_messages
+from utils import load_text, load_pdf, chunk_text, stream_nvidia
+from rag_utils import build_hybrid_index, hybrid_search
+from agent import run_agent
+from database import init_db, save_message, load_messages, load_history_for_llm
+from schemas import RAGResponse, UploadResponse
 
 load_dotenv()
 
+# ── LANGSMITH TRACING SETUP ───────────────────────────────────────────────────
+os.environ.setdefault("LANGCHAIN_TRACING_V2", os.getenv("LANGCHAIN_TRACING_V2", "false"))
+os.environ.setdefault("LANGCHAIN_PROJECT", os.getenv("LANGCHAIN_PROJECT", "smart-qa-app"))
+
 app = Flask(__name__)
+app.secret_key = os.getenv("SECRET_KEY", "dev-secret-change-in-production")
 app.config['UPLOAD_FOLDER'] = "./data"
 
-# -------- GLOBAL (FAISS cannot be stored in session) --------
-faiss_index = None
-chunks_store = []
+# ── GLOBAL STATE ──────────────────────────────────────────────────────────────
+chroma_collection = None
+bm25_index        = None
+chunks_store      = []
 
-# -------- INIT DATABASE --------
 init_db()
 
-# -------- CLEAN OLD FILES --------
+
+# ── HELPERS ───────────────────────────────────────────────────────────────────
 def cleanup_uploads(folder, max_age_seconds=3600):
     now = time.time()
     for f in os.listdir(folder):
@@ -33,94 +44,160 @@ def cleanup_uploads(folder, max_age_seconds=3600):
         if os.path.isfile(path) and now - os.path.getmtime(path) > max_age_seconds:
             os.remove(path)
 
-# -------- EXTRACT SOURCES --------
-def extract_sources(text):
-    return list(set(re.findall(r'Page\s*\d+', text)))
+def extract_sources(text: str) -> list[str]:
+    return list(dict.fromkeys(re.findall(r'Page\s*\d+', text)))
 
-# -------- AI FUNCTION --------
-def ask_question(question):
-    global faiss_index, chunks_store
 
-    if not chunks_store or faiss_index is None:
-        return "❌ Please upload a document first.", []
+# ═══════════════════════════════════════════════════════════════════════════════
+# STREAMING ROUTE
+# ═══════════════════════════════════════════════════════════════════════════════
+@app.route("/stream")
+def stream():
+    global chroma_collection, bm25_index, chunks_store
 
-    context_chunks = search_faiss(question, chunks_store, faiss_index)
+    question = request.args.get("question", "")
+    route    = request.args.get("route", "rag")
 
-    # Build context text with page numbers
-    context_text = ""
-    for c in context_chunks:
-        context_text += f"{c['chunk']} (Page {c['page']})\n"
+    if not question:
+        return Response("data: [DONE]\n\n", mimetype="text/event-stream")
 
-    prompt = f"""
-    Answer clearly and concisely.
-    Quote the exact text from context if available, with page numbers.
-    If not found, say: Not available.
+    history = load_history_for_llm(last_n=10)
 
-    Context:
-    {context_text}
+    if route == "rag" and chroma_collection and bm25_index and chunks_store:
+        chunks = hybrid_search(
+            query=question,
+            all_chunks=chunks_store,
+            chroma_collection=chroma_collection,
+            bm25_index=bm25_index,
+            top_k=5
+        )
+        context = "\n\n".join(chunks)
+        system_content = (
+            "You are a helpful assistant. Answer using ONLY the document context.\n"
+            "Mention page numbers like (Page 2) if available.\n"
+            "If not found, say: 'Not available in the document.'\n\n"
+            f"Context:\n{context}"
+        )
+    else:
+        system_content = (
+            "You are a friendly, helpful assistant. "
+            "Answer conversationally. Keep it short and warm."
+        )
 
-    Question:
-    {question}
-    """
+    messages = (
+        [{"role": "system", "content": system_content}]
+        + history
+        + [{"role": "user", "content": question}]
+    )
 
-    reply = ask_nvidia(prompt, [])
+    def generate():
+        full_answer = []
 
-    # Extract sources
-    sources = list(set([f"Page {c['page']}" for c in context_chunks]))
+        for token in stream_nvidia(messages):
+            full_answer.append(token)
+            yield f"data: {json.dumps(token)}\n\n"
 
-    return reply, sources
+        yield "data: [DONE]\n\n"
 
-# -------- ROUTE --------
+        complete = "".join(full_answer).replace("[Page", "📄 Page")
+        sources  = extract_sources(complete)
+
+        try:
+            validated = RAGResponse(answer=complete, sources=sources, route=route)
+            save_message("assistant", validated.answer, datetime.now().strftime("%H:%M"))
+            print(f"✅ Validated — route={validated.route}, sources={validated.sources}")
+        except Exception as e:
+            print(f"⚠️  Pydantic validation failed: {e}")
+            save_message("assistant", complete, datetime.now().strftime("%H:%M"))
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN ROUTE — PRG pattern (Post → Redirect → Get)
+# ═══════════════════════════════════════════════════════════════════════════════
 @app.route("/", methods=["GET", "POST"])
 def index():
-    global faiss_index, chunks_store
+    global chroma_collection, bm25_index, chunks_store
 
-    cleanup_uploads(app.config['UPLOAD_FOLDER'])
+    # ── GET: render page, pick up any flash data from session ─────────────────
+    if request.method == "GET":
+        upload_status   = session.pop("upload_status", None)
+        stream_question = session.pop("stream_question", None)
+        agent_route     = session.pop("agent_route", None)
 
-    if request.method == "POST":
-        files = request.files.getlist("file")
-        question = request.form.get("question", "").strip()
+        cleanup_uploads(app.config['UPLOAD_FOLDER'])
+        chat_history = load_messages()
 
-        # -------- FILE UPLOAD --------
-        if files and any(f.filename for f in files):
-            all_chunks = []
+        return render_template(
+            "index.html",
+            chat_history=chat_history,
+            upload_status=upload_status,
+            agent_route=agent_route,
+            stream_question=stream_question   # JS reads this ONCE then page is clean
+        )
 
-            for file in files:
-                path = os.path.join(app.config['UPLOAD_FOLDER'], file.filename)
-                file.save(path)
+    # ── POST: process, store results in session, REDIRECT to GET ──────────────
+    # This is the PRG pattern — after POST we always redirect to GET.
+    # This means browser reload will do a GET, not re-submit the POST.
+    files    = request.files.getlist("file")
+    question = request.form.get("question", "").strip()
 
-                if path.endswith(".pdf"):
-                    text = load_pdf(path)
-                else:
-                    text = load_text(path)
+    # ── File upload ───────────────────────────────────────────────────────────
+    if files and any(f.filename for f in files):
+        all_chunks = []
+        for file in files:
+            if not file.filename:
+                continue
+            path = os.path.join(app.config['UPLOAD_FOLDER'], file.filename)
+            file.save(path)
+            text   = load_pdf(path) if path.lower().endswith(".pdf") else load_text(path)
+            chunks = chunk_text(text)
+            all_chunks.extend(chunks)
 
-                chunks = chunk_text(text)
-                all_chunks.extend(chunks)
-
-            # 🔥 Create embeddings + FAISS
-            embeddings = create_embeddings(all_chunks)
-            faiss_index = build_faiss_index(embeddings)
-
+        if all_chunks:
+            chroma_collection, bm25_index = build_hybrid_index(all_chunks)
             chunks_store = all_chunks
+            try:
+                upload_resp = UploadResponse(
+                    success=True,
+                    chunk_count=len(all_chunks),
+                    message=f"Indexed {len(all_chunks)} chunks — hybrid + streaming ready."
+                )
+                session["upload_status"] = f"✅ {upload_resp.message}"
+            except Exception as e:
+                session["upload_status"] = f"⚠️ Upload issue: {e}"
 
-        # -------- ASK QUESTION --------
-        if question:
-            current_time = datetime.now().strftime("%H:%M")
+    # ── Question ──────────────────────────────────────────────────────────────
+    if question:
+        save_message("user", question, datetime.now().strftime("%H:%M"))
 
-            # Save user message
-            save_message("user", question, current_time)
+        _, agent_route = run_agent(
+            question=question,
+            history=load_history_for_llm(last_n=10),
+            chroma_collection=chroma_collection,
+            bm25_index=bm25_index,
+            chunks_store=chunks_store
+        )
 
-            answer, sources = ask_question(question)
+        # Store in session — the GET will read these ONCE and clear them
+        session["stream_question"] = question
+        session["agent_route"]     = agent_route
 
-            # Save AI response
-            save_message("assistant", answer, current_time)
+    # ── Always redirect to GET after POST ────────────────────────────────────
+    return redirect(url_for("index"))
 
-    # Load chat history from DB
-    chat_history = load_messages()
 
-    return render_template("index.html", chat_history=chat_history)
-
-# -------- RUN --------
+# ── RUN ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)
+    app.run(
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 5000)),
+        debug=True,
+        threaded=True
+    )

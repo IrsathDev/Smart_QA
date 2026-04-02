@@ -1,4 +1,6 @@
 # utils.py
+# Step 1 Upgrade: Added overlap chunking for better context preservation
+
 import os
 from PyPDF2 import PdfReader
 from dotenv import load_dotenv
@@ -14,48 +16,62 @@ HEADERS = {
     "Content-Type": "application/json"
 }
 
-# -------- Load Files --------
-def load_text(file_path):
+
+# ── LOAD TEXT FILE ────────────────────────────────────────────────────────────
+def load_text(file_path: str) -> str:
     with open(file_path, "r", encoding="utf-8") as f:
-        return [{"text": f.read(), "page": None}]
+        return f.read()
 
-def load_pdf(file_path):
+
+# ── LOAD PDF WITH PAGE NUMBERS ────────────────────────────────────────────────
+def load_pdf(file_path: str) -> str:
     reader = PdfReader(file_path)
-    chunks = []
+    text = []
     for i, page in enumerate(reader.pages):
-        text = page.extract_text() or ""
-        chunks.append({"text": text, "page": i+1})
-    return chunks
+        page_text = page.extract_text() or ""
+        if page_text.strip():
+            text.append(f"[Page {i+1}] {page_text}")
+    return "\n".join(text)
 
-def chunk_text(pages, chunk_size=500):
+
+# ── IMPROVED CHUNKING WITH OVERLAP ────────────────────────────────────────────
+def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> list[str]:
     """
-    pages: list of dicts [{"text":..., "page":...}]
-    returns list of dicts [{"chunk":..., "page":...}]
+    Splits text into overlapping chunks.
+    Overlap ensures context is not lost at chunk boundaries.
+    
+    Example: chunk_size=500, overlap=50
+    chunk 1: chars 0-500
+    chunk 2: chars 450-950   ← 50 chars overlap with chunk 1
+    chunk 3: chars 900-1400  ← 50 chars overlap with chunk 2
     """
     chunks = []
-    for page in pages:
-        text = page["text"]
-        page_number = page["page"]
-        for i in range(0, len(text), chunk_size):
-            chunks.append({"chunk": text[i:i+chunk_size], "page": page_number})
+    step = chunk_size - overlap
+    for i in range(0, len(text), step):
+        chunk = text[i: i + chunk_size]
+        if chunk.strip():
+            chunks.append(chunk)
     return chunks
 
-# -------- Keyword Retrieval --------
-def get_relevant_chunks(question, chunks, top_k=3):
-    words = question.lower().split()
-    scored = []
 
-    for chunk in chunks:
-        score = sum(word in chunk.lower() for word in words)
-        if score > 0:
-            scored.append((score, chunk))
+# ── NVIDIA LLAMA CHAT (non-streaming) ────────────────────────────────────────
+def ask_nvidia(prompt: str, chat_history: list = []) -> str:
+    """
+    Two calling modes:
 
-    scored.sort(reverse=True)
-    return [c for _, c in scored[:top_k]] if scored else chunks[:top_k]
+    Mode A — classic (used by router node):
+        ask_nvidia("classify this...", [])
+        → appends prompt as a user message
 
-# -------- NVIDIA Chat --------
-def ask_nvidia(prompt, chat_history=[]):
-    messages = chat_history + [{"role": "user", "content": prompt}]
+    Mode B — messages-only (used by rag_node / chitchat_node):
+        ask_nvidia("", full_messages_list)
+        → uses chat_history directly (already contains system + history + question)
+        → prompt is ignored when it's an empty string
+    """
+    if prompt:
+        messages = chat_history + [{"role": "user", "content": prompt}]
+    else:
+        messages = chat_history   # agent already built the full message list
 
     payload = {
         "model": "meta/llama3-70b-instruct",
@@ -73,7 +89,60 @@ def ask_nvidia(prompt, chat_history=[]):
 
     return response.json()["choices"][0]["message"]["content"]
 
+# ── NVIDIA LLAMA CHAT (streaming) — Step 4 ───────────────────────────────────
+def stream_nvidia(messages: list[dict]):
+    """
+    Generator function that streams the LLM response token by token.
 
+    HOW SSE (Server-Sent Events) WORKS:
+    1. Flask sends HTTP response with Content-Type: text/event-stream
+    2. This generator yields small text chunks as they arrive from NVIDIA
+    3. The browser's JS EventSource reads each chunk and appends it to the UI
+    4. User sees text appearing word-by-word — no waiting for full response
 
-from PyPDF2 import PdfReader
+    HOW stream=True WORKS with NVIDIA API:
+    - Normal call:   NVIDIA waits for full answer → sends one big JSON blob
+    - Streaming call: NVIDIA sends partial tokens immediately as SSE lines
+      Each line: data: {"choices":[{"delta":{"content":"Hello"}}]}
+      Last line:  data: [DONE]
 
+    Yields: plain text token strings (app.py wraps them in SSE format)
+    """
+    import json
+
+    payload = {
+        "model": "meta/llama3-70b-instruct",
+        "messages": messages,
+        "temperature": 0.5,
+        "max_tokens": 500,
+        "stream": True
+    }
+
+    with requests.post(
+        f"{BASE_URL}/chat/completions",
+        headers=HEADERS,
+        json=payload,
+        stream=True
+    ) as response:
+        response.raise_for_status()
+
+        for line in response.iter_lines():
+            if not line:
+                continue
+
+            text = line.decode("utf-8")
+            if not text.startswith("data:"):
+                continue
+
+            data_str = text[len("data:"):].strip()
+
+            if data_str == "[DONE]":
+                break
+
+            try:
+                data = json.loads(data_str)
+                token = data["choices"][0]["delta"].get("content", "")
+                if token:
+                    yield token
+            except (json.JSONDecodeError, KeyError, IndexError):
+                continue
