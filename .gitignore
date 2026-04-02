@@ -1,8 +1,9 @@
 # dotenv environment variables
-.env
 
 # Flask session data
 flask_session/
 
 # Uploaded files
 data/
+config.bat
+node_modules
