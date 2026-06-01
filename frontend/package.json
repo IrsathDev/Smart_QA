@@ -1,0 +1,26 @@
+{
+  "name": "smart-qa-v3",
+  "private": true,
+  "version": "3.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "node ./node_modules/vite/bin/vite.js --host 127.0.0.1 --port 5173",
+    "build": "node ./node_modules/typescript/bin/tsc --noEmit -p tsconfig.app.json && node ./node_modules/vite/bin/vite.js build",
+    "lint": "node ./node_modules/typescript/bin/tsc --noEmit -p tsconfig.app.json --pretty false",
+    "test": "node ./node_modules/vitest/vitest.mjs run"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-markdown": "^9.0.1",
+    "remark-gfm": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.18",
+    "@types/react-dom": "^18.3.5",
+    "@vitejs/plugin-react": "^4.3.4",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.5",
+    "vitest": "^2.1.8"
+  }
+}
